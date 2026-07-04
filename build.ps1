@@ -18,6 +18,7 @@ if (-not (Test-Path -LiteralPath $compiler)) {
     /reference:System.dll `
     /reference:System.Core.dll `
     /reference:System.Drawing.dll `
+    /reference:System.Security.dll `
     /reference:System.Windows.Forms.dll `
     "$source"
 

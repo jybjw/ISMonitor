@@ -1,7 +1,10 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -193,6 +196,7 @@ namespace InternetShutdownMonitor
 
             Resize += MainForm_Resize;
             FormClosing += MainForm_FormClosing;
+            LoadSavedSettings();
             UpdateCountdownLabel();
         }
 
@@ -236,6 +240,7 @@ namespace InternetShutdownMonitor
                 return;
             }
 
+            SaveCurrentSettings();
             monitoring = true;
             countdownActive = false;
             ResetAuthenticationState();
@@ -420,6 +425,12 @@ namespace InternetShutdownMonitor
             SetStatus("正在打开认证页面", Color.FromArgb(25, 94, 160));
             AddLog("无法连接 Internet，正在打开认证页面，第 " + attempt + " 次尝试。");
 
+            if (IsLuciAuthenticationUri(authUri))
+            {
+                BeginLuciAuthentication(authUri);
+                return;
+            }
+
             try
             {
                 authBrowser.Navigate(authUri);
@@ -447,6 +458,44 @@ namespace InternetShutdownMonitor
             }
 
             return Uri.TryCreate(candidate, UriKind.Absolute, out uri);
+        }
+
+        private static bool IsLuciAuthenticationUri(Uri uri)
+        {
+            return uri.AbsolutePath.IndexOf("/cgi-bin/luci", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private void BeginLuciAuthentication(Uri uri)
+        {
+            string username = usernameInput.Text.Trim();
+            string password = passwordInput.Text;
+            AddLog("检测到 LuCI/iStoreOS 认证页面，使用直连登录方式。");
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string error;
+                bool success = LuciAuthenticator.TryLogin(uri, username, password, out error);
+                BeginInvoke(new Action(delegate
+                {
+                    if (!monitoring || !authenticationActive)
+                    {
+                        return;
+                    }
+
+                    if (!success)
+                    {
+                        FailAuthenticationAttempt("LuCI/iStoreOS 登录失败：" + error);
+                        return;
+                    }
+
+                    loginSubmitted = true;
+                    authenticationVerifyPending = true;
+                    authenticationDeadline = DateTime.Now.AddSeconds(AuthPageTimeoutSeconds);
+                    authenticationVerifyAt = DateTime.Now.AddSeconds(AuthVerifyDelaySeconds);
+                    SetStatus("已提交认证，正在验证", Color.FromArgb(25, 94, 160));
+                    AddLog("LuCI/iStoreOS 登录成功，等待网络恢复验证。");
+                }));
+            });
         }
 
         private void AuthBrowser_DocumentCompleted(object sender, WebBrowserDocumentCompletedEventArgs e)
@@ -717,14 +766,57 @@ namespace InternetShutdownMonitor
                 if (result != DialogResult.Yes)
                 {
                     e.Cancel = true;
+                    return;
                 }
             }
+
+            SaveCurrentSettings();
         }
 
         private void ExitApplication()
         {
+            SaveCurrentSettings();
             trayIcon.Visible = false;
             Application.Exit();
+        }
+
+        private void LoadSavedSettings()
+        {
+            AppSettings settings = AppSettings.Load();
+            countdownMinutesInput.Value = Clamp(settings.CountdownMinutes, countdownMinutesInput.Minimum, countdownMinutesInput.Maximum);
+            checkIntervalInput.Value = Clamp(settings.CheckIntervalSeconds, checkIntervalInput.Minimum, checkIntervalInput.Maximum);
+            authUrlInput.Text = settings.AuthUrl;
+            usernameInput.Text = settings.Username;
+            passwordInput.Text = settings.Password;
+        }
+
+        private void SaveCurrentSettings()
+        {
+            AppSettings settings = new AppSettings
+            {
+                CountdownMinutes = (int)countdownMinutesInput.Value,
+                CheckIntervalSeconds = (int)checkIntervalInput.Value,
+                AuthUrl = authUrlInput.Text.Trim(),
+                Username = usernameInput.Text.Trim(),
+                Password = passwordInput.Text
+            };
+
+            settings.Save();
+        }
+
+        private static decimal Clamp(int value, decimal minimum, decimal maximum)
+        {
+            if (value < minimum)
+            {
+                return minimum;
+            }
+
+            if (value > maximum)
+            {
+                return maximum;
+            }
+
+            return value;
         }
 
         protected override void Dispose(bool disposing)
@@ -785,6 +877,224 @@ namespace InternetShutdownMonitor
             {
                 return false;
             }
+        }
+    }
+
+    internal static class LuciAuthenticator
+    {
+        public static bool TryLogin(Uri authUri, string username, string password, out string error)
+        {
+            error = String.Empty;
+
+            try
+            {
+                Uri loginUri = BuildLoginUri(authUri);
+                string form = "luci_username=" + Uri.EscapeDataString(username) +
+                    "&luci_password=" + Uri.EscapeDataString(password);
+                byte[] body = System.Text.Encoding.UTF8.GetBytes(form);
+
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(loginUri);
+                request.Method = "POST";
+                request.ContentType = "application/x-www-form-urlencoded";
+                request.ContentLength = body.Length;
+                request.Timeout = 10000;
+                request.ReadWriteTimeout = 10000;
+                request.AllowAutoRedirect = false;
+                request.UserAgent = "InternetShutdownMonitor/1.0";
+
+                using (System.IO.Stream stream = request.GetRequestStream())
+                {
+                    stream.Write(body, 0, body.Length);
+                }
+
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                {
+                    bool redirected = response.StatusCode == HttpStatusCode.Found ||
+                        response.StatusCode == HttpStatusCode.SeeOther ||
+                        response.StatusCode == HttpStatusCode.Redirect;
+                    bool hasAuthCookie = response.Headers["Set-Cookie"] != null &&
+                        response.Headers["Set-Cookie"].IndexOf("sysauth", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (redirected && hasAuthCookie)
+                    {
+                        return true;
+                    }
+
+                    error = "认证响应不包含有效登录凭据。";
+                    return false;
+                }
+            }
+            catch (WebException ex)
+            {
+                HttpWebResponse response = ex.Response as HttpWebResponse;
+                if (response != null)
+                {
+                    error = "HTTP " + (int)response.StatusCode + " " + response.StatusDescription;
+                    response.Close();
+                    return false;
+                }
+
+                error = ex.Message;
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static Uri BuildLoginUri(Uri authUri)
+        {
+            UriBuilder builder = new UriBuilder(authUri);
+            if (!builder.Path.EndsWith("/", StringComparison.Ordinal))
+            {
+                builder.Path = builder.Path + "/";
+            }
+
+            return builder.Uri;
+        }
+    }
+
+    internal sealed class AppSettings
+    {
+        private const int DefaultCountdownMinutes = 10;
+        private const int DefaultCheckIntervalSeconds = 10;
+        private static readonly byte[] PasswordEntropy = Encoding.UTF8.GetBytes("InternetShutdownMonitor.Settings.v1");
+
+        public int CountdownMinutes = DefaultCountdownMinutes;
+        public int CheckIntervalSeconds = DefaultCheckIntervalSeconds;
+        public string AuthUrl = String.Empty;
+        public string Username = String.Empty;
+        public string Password = String.Empty;
+
+        public static AppSettings Load()
+        {
+            AppSettings settings = new AppSettings();
+            string path = GetSettingsPath();
+
+            if (!File.Exists(path))
+            {
+                return settings;
+            }
+
+            try
+            {
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                foreach (string line in lines)
+                {
+                    int splitIndex = line.IndexOf('=');
+                    if (splitIndex <= 0)
+                    {
+                        continue;
+                    }
+
+                    string key = line.Substring(0, splitIndex);
+                    string value = line.Substring(splitIndex + 1);
+
+                    if (key == "CountdownMinutes")
+                    {
+                        settings.CountdownMinutes = ParseInt(value, DefaultCountdownMinutes);
+                    }
+                    else if (key == "CheckIntervalSeconds")
+                    {
+                        settings.CheckIntervalSeconds = ParseInt(value, DefaultCheckIntervalSeconds);
+                    }
+                    else if (key == "AuthUrl")
+                    {
+                        settings.AuthUrl = DecodeText(value);
+                    }
+                    else if (key == "Username")
+                    {
+                        settings.Username = DecodeText(value);
+                    }
+                    else if (key == "Password")
+                    {
+                        settings.Password = UnprotectText(value);
+                    }
+                }
+            }
+            catch
+            {
+                return new AppSettings();
+            }
+
+            return settings;
+        }
+
+        public void Save()
+        {
+            string path = GetSettingsPath();
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+
+            string[] lines =
+            {
+                "CountdownMinutes=" + CountdownMinutes,
+                "CheckIntervalSeconds=" + CheckIntervalSeconds,
+                "AuthUrl=" + EncodeText(AuthUrl),
+                "Username=" + EncodeText(Username),
+                "Password=" + ProtectText(Password)
+            };
+
+            File.WriteAllLines(path, lines, Encoding.UTF8);
+        }
+
+        private static string GetSettingsPath()
+        {
+            string folder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "InternetShutdownMonitor");
+            return Path.Combine(folder, "settings.dat");
+        }
+
+        private static int ParseInt(string value, int defaultValue)
+        {
+            int parsed;
+            return Int32.TryParse(value, out parsed) ? parsed : defaultValue;
+        }
+
+        private static string EncodeText(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                return String.Empty;
+            }
+
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+        }
+
+        private static string DecodeText(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                return String.Empty;
+            }
+
+            return Encoding.UTF8.GetString(Convert.FromBase64String(value));
+        }
+
+        private static string ProtectText(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                return String.Empty;
+            }
+
+            byte[] plainBytes = Encoding.UTF8.GetBytes(value);
+            byte[] protectedBytes = ProtectedData.Protect(plainBytes, PasswordEntropy, DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(protectedBytes);
+        }
+
+        private static string UnprotectText(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                return String.Empty;
+            }
+
+            byte[] protectedBytes = Convert.FromBase64String(value);
+            byte[] plainBytes = ProtectedData.Unprotect(protectedBytes, PasswordEntropy, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(plainBytes);
         }
     }
 }
