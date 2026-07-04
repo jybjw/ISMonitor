@@ -1,7 +1,6 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
-using System.IO;
 using System.Net;
 using System.Threading;
 using System.Windows.Forms;
@@ -21,13 +20,21 @@ namespace InternetShutdownMonitor
 
     internal sealed class MainForm : Form
     {
+        private const int AuthRetryDelaySeconds = 10;
+        private const int AuthPageTimeoutSeconds = 25;
+        private const int AuthVerifyDelaySeconds = 6;
+
         private readonly NumericUpDown countdownMinutesInput;
         private readonly NumericUpDown checkIntervalInput;
+        private readonly TextBox authUrlInput;
+        private readonly TextBox usernameInput;
+        private readonly TextBox passwordInput;
         private readonly Button startButton;
         private readonly Button stopButton;
         private readonly Label statusValueLabel;
         private readonly Label countdownValueLabel;
         private readonly TextBox logTextBox;
+        private readonly WebBrowser authBrowser;
         private readonly System.Windows.Forms.Timer uiTimer;
         private readonly NotifyIcon trayIcon;
         private readonly ContextMenuStrip trayMenu;
@@ -36,15 +43,23 @@ namespace InternetShutdownMonitor
         private bool monitoring;
         private bool checking;
         private bool countdownActive;
+        private bool authenticationActive;
+        private bool authenticationRetryPending;
+        private bool authenticationVerifyPending;
+        private bool loginSubmitted;
+        private int authenticationAttempt;
         private int remainingSeconds;
         private DateTime nextCheckAt;
+        private DateTime authenticationDeadline;
+        private DateTime authenticationRetryAt;
+        private DateTime authenticationVerifyAt;
 
         public MainForm()
         {
             Text = "Internet 断网关机监控";
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(560, 430);
-            MinimumSize = new Size(560, 430);
+            ClientSize = new Size(720, 660);
+            MinimumSize = new Size(720, 660);
             Font = new Font("Microsoft YaHei UI", 9F);
             Icon = LoadAppIcon();
 
@@ -54,7 +69,7 @@ namespace InternetShutdownMonitor
                 Maximum = 1440,
                 Value = 10,
                 Width = 120,
-                Location = new Point(160, 24)
+                Location = new Point(165, 24)
             };
 
             checkIntervalInput = new NumericUpDown
@@ -63,22 +78,41 @@ namespace InternetShutdownMonitor
                 Maximum = 300,
                 Value = 10,
                 Width = 120,
-                Location = new Point(160, 64)
+                Location = new Point(165, 64)
+            };
+
+            authUrlInput = new TextBox
+            {
+                Width = 430,
+                Location = new Point(165, 104)
+            };
+
+            usernameInput = new TextBox
+            {
+                Width = 180,
+                Location = new Point(165, 144)
+            };
+
+            passwordInput = new TextBox
+            {
+                Width = 180,
+                Location = new Point(415, 144),
+                UseSystemPasswordChar = true
             };
 
             startButton = new Button
             {
                 Text = "开始检测",
-                Location = new Point(320, 22),
-                Size = new Size(100, 32)
+                Location = new Point(485, 22),
+                Size = new Size(95, 32)
             };
             startButton.Click += StartButton_Click;
 
             stopButton = new Button
             {
                 Text = "停止检测",
-                Location = new Point(430, 22),
-                Size = new Size(100, 32),
+                Location = new Point(590, 22),
+                Size = new Size(95, 32),
                 Enabled = false
             };
             stopButton.Click += StopButton_Click;
@@ -87,7 +121,7 @@ namespace InternetShutdownMonitor
             {
                 Text = "未开始",
                 AutoSize = true,
-                Location = new Point(160, 115),
+                Location = new Point(165, 190),
                 ForeColor = Color.DimGray
             };
 
@@ -96,31 +130,47 @@ namespace InternetShutdownMonitor
                 Text = "--:--",
                 AutoSize = true,
                 Font = new Font("Microsoft YaHei UI", 22F, FontStyle.Bold),
-                Location = new Point(155, 142),
+                Location = new Point(160, 217),
                 ForeColor = Color.FromArgb(25, 94, 160)
             };
 
             logTextBox = new TextBox
             {
-                Location = new Point(24, 210),
-                Size = new Size(506, 170),
+                Location = new Point(24, 310),
+                Size = new Size(660, 135),
                 Multiline = true,
                 ReadOnly = true,
                 ScrollBars = ScrollBars.Vertical
             };
 
+            authBrowser = new WebBrowser
+            {
+                Location = new Point(24, 480),
+                Size = new Size(660, 135),
+                ScriptErrorsSuppressed = true
+            };
+            authBrowser.DocumentCompleted += AuthBrowser_DocumentCompleted;
+
             Controls.Add(CreateLabel("关机倒计时（分钟）", 24, 27));
             Controls.Add(countdownMinutesInput);
             Controls.Add(CreateLabel("检测间隔（秒）", 24, 67));
             Controls.Add(checkIntervalInput);
+            Controls.Add(CreateLabel("认证页面网址", 24, 107));
+            Controls.Add(authUrlInput);
+            Controls.Add(CreateLabel("登录账号", 24, 147));
+            Controls.Add(usernameInput);
+            Controls.Add(CreateLabel("登录密码", 340, 147));
+            Controls.Add(passwordInput);
             Controls.Add(startButton);
             Controls.Add(stopButton);
-            Controls.Add(CreateLabel("当前状态", 24, 115));
+            Controls.Add(CreateLabel("当前状态", 24, 190));
             Controls.Add(statusValueLabel);
-            Controls.Add(CreateLabel("剩余倒计时", 24, 156));
+            Controls.Add(CreateLabel("剩余倒计时", 24, 231));
             Controls.Add(countdownValueLabel);
-            Controls.Add(CreateLabel("运行日志", 24, 188));
+            Controls.Add(CreateLabel("运行日志", 24, 288));
             Controls.Add(logTextBox);
+            Controls.Add(CreateLabel("认证页面", 24, 458));
+            Controls.Add(authBrowser);
 
             uiTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             uiTimer.Tick += UiTimer_Tick;
@@ -188,12 +238,12 @@ namespace InternetShutdownMonitor
 
             monitoring = true;
             countdownActive = false;
+            ResetAuthenticationState();
             remainingSeconds = 0;
             nextCheckAt = DateTime.MinValue;
             startButton.Enabled = false;
             stopButton.Enabled = true;
-            countdownMinutesInput.Enabled = false;
-            checkIntervalInput.Enabled = false;
+            SetInputsEnabled(false);
             SetStatus("检测中", Color.FromArgb(25, 94, 160));
             AddLog("开始检测 Internet 连接。");
             uiTimer.Start();
@@ -202,22 +252,31 @@ namespace InternetShutdownMonitor
 
         private void StopMonitoring(string reason)
         {
-            if (!monitoring && !countdownActive)
+            if (!monitoring && !countdownActive && !authenticationActive)
             {
                 return;
             }
 
             monitoring = false;
             countdownActive = false;
+            ResetAuthenticationState();
             remainingSeconds = 0;
             uiTimer.Stop();
             startButton.Enabled = true;
             stopButton.Enabled = false;
-            countdownMinutesInput.Enabled = true;
-            checkIntervalInput.Enabled = true;
+            SetInputsEnabled(true);
             SetStatus("已停止", Color.DimGray);
             UpdateCountdownLabel();
             AddLog(reason);
+        }
+
+        private void SetInputsEnabled(bool enabled)
+        {
+            countdownMinutesInput.Enabled = enabled;
+            checkIntervalInput.Enabled = enabled;
+            authUrlInput.Enabled = enabled;
+            usernameInput.Enabled = enabled;
+            passwordInput.Enabled = enabled;
         }
 
         private void UiTimer_Tick(object sender, EventArgs e)
@@ -239,6 +298,22 @@ namespace InternetShutdownMonitor
                     StopMonitoring("关机命令已发送。");
                     return;
                 }
+            }
+
+            if (authenticationRetryPending && DateTime.Now >= authenticationRetryAt)
+            {
+                StartAuthenticationAttempt(authenticationAttempt + 1);
+            }
+
+            if (authenticationVerifyPending && DateTime.Now >= authenticationVerifyAt)
+            {
+                authenticationVerifyPending = false;
+                BeginNetworkCheck();
+            }
+
+            if (authenticationActive && DateTime.Now >= authenticationDeadline)
+            {
+                FailAuthenticationAttempt("认证页面打开或登录超时。");
             }
 
             UpdateCountdownLabel();
@@ -288,21 +363,280 @@ namespace InternetShutdownMonitor
                     AddLog("Internet 已恢复，取消关机倒计时。");
                 }
 
+                if (authenticationActive || authenticationRetryPending)
+                {
+                    AddLog("Internet 已恢复，停止认证重试。");
+                }
+
                 countdownActive = false;
                 remainingSeconds = 0;
+                ResetAuthenticationState();
                 SetStatus("Internet 正常", Color.ForestGreen);
                 UpdateCountdownLabel();
                 return;
             }
 
-            if (!countdownActive)
+            if (countdownActive)
             {
-                countdownActive = true;
-                remainingSeconds = (int)countdownMinutesInput.Value * 60;
-                AddLog("无法连接 Internet，开始关机倒计时。");
+                SetStatus("断网倒计时中", Color.Firebrick);
+                return;
             }
 
+            if (authenticationActive || authenticationRetryPending)
+            {
+                return;
+            }
+
+            if (HasAuthenticationSettings())
+            {
+                StartAuthenticationAttempt(1);
+                return;
+            }
+
+            StartShutdownCountdown("无法连接 Internet，未设置认证页面，开始关机倒计时。");
+        }
+
+        private bool HasAuthenticationSettings()
+        {
+            return authUrlInput.Text.Trim().Length > 0;
+        }
+
+        private void StartAuthenticationAttempt(int attempt)
+        {
+            Uri authUri;
+            if (!TryBuildUri(authUrlInput.Text.Trim(), out authUri))
+            {
+                StartShutdownCountdown("认证页面网址无效，开始关机倒计时。");
+                return;
+            }
+
+            authenticationActive = true;
+            authenticationRetryPending = false;
+            authenticationVerifyPending = false;
+            loginSubmitted = false;
+            authenticationAttempt = attempt;
+            authenticationDeadline = DateTime.Now.AddSeconds(AuthPageTimeoutSeconds);
+
+            SetStatus("正在打开认证页面", Color.FromArgb(25, 94, 160));
+            AddLog("无法连接 Internet，正在打开认证页面，第 " + attempt + " 次尝试。");
+
+            try
+            {
+                authBrowser.Navigate(authUri);
+            }
+            catch (Exception ex)
+            {
+                FailAuthenticationAttempt("认证页面打开失败：" + ex.Message);
+            }
+        }
+
+        private static bool TryBuildUri(string input, out Uri uri)
+        {
+            uri = null;
+
+            if (input.Length == 0)
+            {
+                return false;
+            }
+
+            string candidate = input;
+            if (!candidate.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !candidate.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                candidate = "http://" + candidate;
+            }
+
+            return Uri.TryCreate(candidate, UriKind.Absolute, out uri);
+        }
+
+        private void AuthBrowser_DocumentCompleted(object sender, WebBrowserDocumentCompletedEventArgs e)
+        {
+            if (!authenticationActive || loginSubmitted || authBrowser.Document == null)
+            {
+                return;
+            }
+
+            bool submitted = TrySubmitAuthenticationForm();
+            if (!submitted)
+            {
+                FailAuthenticationAttempt("认证页面已打开，但未找到可填写的账号密码表单。");
+                return;
+            }
+
+            loginSubmitted = true;
+            authenticationVerifyPending = true;
+            authenticationDeadline = DateTime.Now.AddSeconds(AuthPageTimeoutSeconds);
+            authenticationVerifyAt = DateTime.Now.AddSeconds(AuthVerifyDelaySeconds);
+            SetStatus("已提交认证，正在验证", Color.FromArgb(25, 94, 160));
+            AddLog("认证信息已提交，等待网络恢复验证。");
+        }
+
+        private bool TrySubmitAuthenticationForm()
+        {
+            HtmlDocument document = authBrowser.Document;
+            if (document == null)
+            {
+                return false;
+            }
+
+            HtmlElement passwordElement = FindFirstInput(document, "password");
+            HtmlElement usernameElement = FindUsernameInput(document, passwordElement);
+
+            if (usernameElement == null && usernameInput.Text.Trim().Length > 0)
+            {
+                return false;
+            }
+
+            if (passwordElement == null && passwordInput.Text.Length > 0)
+            {
+                return false;
+            }
+
+            if (usernameElement != null)
+            {
+                usernameElement.SetAttribute("value", usernameInput.Text.Trim());
+            }
+
+            if (passwordElement != null)
+            {
+                passwordElement.SetAttribute("value", passwordInput.Text);
+            }
+
+            HtmlElement submitElement = FindSubmitElement(document);
+            if (submitElement != null)
+            {
+                submitElement.InvokeMember("click");
+                return true;
+            }
+
+            HtmlElement form = usernameElement != null ? usernameElement.Parent : null;
+            while (form != null && !String.Equals(form.TagName, "form", StringComparison.OrdinalIgnoreCase))
+            {
+                form = form.Parent;
+            }
+
+            if (form != null)
+            {
+                form.InvokeMember("submit");
+                return true;
+            }
+
+            return false;
+        }
+
+        private static HtmlElement FindUsernameInput(HtmlDocument document, HtmlElement passwordElement)
+        {
+            HtmlElementCollection inputs = document.GetElementsByTagName("input");
+            foreach (HtmlElement input in inputs)
+            {
+                string type = input.GetAttribute("type").ToLowerInvariant();
+                if (type == "password" || type == "hidden" || type == "submit" || type == "button" || type == "checkbox" || type == "radio")
+                {
+                    continue;
+                }
+
+                string name = (input.GetAttribute("name") + " " + input.GetAttribute("id") + " " + input.GetAttribute("placeholder")).ToLowerInvariant();
+                if (name.Contains("user") || name.Contains("account") || name.Contains("login") || name.Contains("phone") || name.Contains("mobile") || name.Contains("email") || name.Contains("name"))
+                {
+                    return input;
+                }
+            }
+
+            foreach (HtmlElement input in inputs)
+            {
+                string type = input.GetAttribute("type").ToLowerInvariant();
+                if (type.Length == 0 || type == "text" || type == "email" || type == "tel")
+                {
+                    return input;
+                }
+            }
+
+            return null;
+        }
+
+        private static HtmlElement FindFirstInput(HtmlDocument document, string inputType)
+        {
+            HtmlElementCollection inputs = document.GetElementsByTagName("input");
+            foreach (HtmlElement input in inputs)
+            {
+                if (String.Equals(input.GetAttribute("type"), inputType, StringComparison.OrdinalIgnoreCase))
+                {
+                    return input;
+                }
+            }
+
+            return null;
+        }
+
+        private static HtmlElement FindSubmitElement(HtmlDocument document)
+        {
+            HtmlElementCollection inputs = document.GetElementsByTagName("input");
+            foreach (HtmlElement input in inputs)
+            {
+                string type = input.GetAttribute("type").ToLowerInvariant();
+                if (type == "submit" || type == "button")
+                {
+                    return input;
+                }
+            }
+
+            HtmlElementCollection buttons = document.GetElementsByTagName("button");
+            foreach (HtmlElement button in buttons)
+            {
+                return button;
+            }
+
+            return null;
+        }
+
+        private void FailAuthenticationAttempt(string reason)
+        {
+            if (!authenticationActive)
+            {
+                return;
+            }
+
+            AddLog(reason);
+            authenticationActive = false;
+            authenticationVerifyPending = false;
+
+            if (authenticationAttempt < 2)
+            {
+                authenticationRetryPending = true;
+                authenticationRetryAt = DateTime.Now.AddSeconds(AuthRetryDelaySeconds);
+                SetStatus("认证失败，10 秒后重试", Color.DarkOrange);
+                AddLog("10 秒后重新打开认证页面。");
+                return;
+            }
+
+            authenticationRetryPending = false;
+            StartShutdownCountdown("认证重试仍未成功，开始关机倒计时。");
+        }
+
+        private void ResetAuthenticationState()
+        {
+            authenticationActive = false;
+            authenticationRetryPending = false;
+            authenticationVerifyPending = false;
+            loginSubmitted = false;
+            authenticationAttempt = 0;
+            authenticationDeadline = DateTime.MinValue;
+            authenticationRetryAt = DateTime.MinValue;
+            authenticationVerifyAt = DateTime.MinValue;
+        }
+
+        private void StartShutdownCountdown(string reason)
+        {
+            if (countdownActive)
+            {
+                return;
+            }
+
+            countdownActive = true;
+            remainingSeconds = (int)countdownMinutesInput.Value * 60;
+            ResetAuthenticationState();
             SetStatus("断网倒计时中", Color.Firebrick);
+            AddLog(reason);
             UpdateCountdownLabel();
         }
 
